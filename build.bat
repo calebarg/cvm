@@ -4,5 +4,5 @@
 if not exist build mkdir build
 
 pushd build
-cl ..\src\selvm\selvm_main.cpp /ZI /I..\src  /Fe"selvm.exe" 
+cl ..\src\cvm\cvm_main.cpp /ZI /I..\src  /Fe"cvm.exe" 
 popd

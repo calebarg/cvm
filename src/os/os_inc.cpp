@@ -36,8 +36,7 @@ internal void os_popd(OS_PathStack* path_stack)
    SLLStackPush(path_stack->free_list, last_dir);
 }
 
-
-#ifdef WIN32
+#ifdef _MSC_VER 
 #include "win32/win32_stuff.cpp"
 #elif __GNUC__
 #include "linux/linux_stuff.cpp"

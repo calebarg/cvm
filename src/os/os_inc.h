@@ -25,7 +25,7 @@ internal void os_mkdir(String8 path);
 internal B8 os_dir_exists(String8 rel_path);
 internal B8 os_file_exists(String8 path);
 
-#ifdef WIN32
+#ifdef _MSC_VER
 #include "Windows.h"
 //#include "win32/win32_stuff.h"
 #elif __GNUC__
