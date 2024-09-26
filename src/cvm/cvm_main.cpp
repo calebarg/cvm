@@ -43,6 +43,18 @@ struct ELF_SectionHeader
 	U64 entsize;
 };
 
+inline U64* gp_regx(U8* gp_regs, U8 reg_idx) 
+{
+  U64* gp_regs_ptrx = (U64*)gp_regs;
+  return (gp_regs_ptrx + reg_idx);   
+}
+
+inline U32* gp_regw(U8* gp_regs, U8 reg_idx) 
+{
+  U64* gp_regs_ptrx = (U64*)gp_regs;
+  return (U32*)(gp_regs_ptrx + reg_idx);   
+}
+
 int main(int argc, char* argv[])
 {
   if (argc < 2)
@@ -90,7 +102,8 @@ int main(int argc, char* argv[])
   }
 
   // TODO(actually read the manual)
-  U8* register_memory = (U8*)arena_push(arena, 32*8);
+  U8* gp_regs = (U8*)arena_push(arena, 32*8); // NOTE(caleb): R31 is reserved as the zero register.
+  memset(gp_regs, 0, 32*8);
 
   U64 instruction_count = machine_code.len / 4;
   U32* instructions = (U32*)machine_code.data;
@@ -104,7 +117,6 @@ int main(int argc, char* argv[])
     U8 next_most_signif_byte = ((U8*)(&instructions[instruction_idx]))[2];
     printf("%b\n", next_most_signif_byte);
 #endif
-    // Get the decode group
     U8 decode_group = (instructions[instruction_idx] >> 25) & 0xf;
     if (decode_group & 0x8) // Data processing immediate group
     {
@@ -116,19 +128,17 @@ int main(int argc, char* argv[])
         U8 op_code = (instructions[instruction_idx] >> 29) & 0x3;
         switch (op_code)
         {
-          case 0x2: // MOVZ
+          case 0x2: // MOVZ 
           {
             U16 immediate_val = (instructions[instruction_idx] >> 5) & 0xffff;
             U8 dest_reg = instructions[instruction_idx] & 0xf;
-
             if (sf)
             {
-              InvalidPath;
-              ((U64*)register_memory)[dest_reg] = immediate_val;
+              ((U64*)gp_regs)[dest_reg] = immediate_val;
             }
             else
             {
-              ((U32*)(&((U64*)register_memory)[dest_reg]))[1] = immediate_val;
+              ((U32*)(&((U64*)gp_regs)[dest_reg]))[1] = immediate_val;
             }
           } break;
           default: break;
@@ -136,7 +146,59 @@ int main(int argc, char* argv[])
       }
       else
       {
-        printf("Unhandled instruction class %b\n", instruction_class);
+        InvalidPath; // Unsupported instruction class
+      }
+    }
+    else if(decode_group & 0x5) // Data processing register group
+    {
+      U8 op0 = (instructions[instruction_idx] >> 30) & 0x1;
+      U8 op1 = (instructions[instruction_idx] >> 28) & 0x1;      
+      U8 op2 = (instructions[instruction_idx] >> 21) & 0xf;      
+      if (!op1 && !(op2 & 0x8)) // Logical (shifted register) instruction class 
+      {
+        B8 sf = (instructions[instruction_idx] >> 31) & 0x1;
+        U8 opc = (instructions[instruction_idx] >> 29) & 0x3;
+        switch (opc)
+        {
+          case 0x1: // ORR/ORN
+          {
+            U8 n = (instructions[instruction_idx] >> 21) & 0x1; 
+            U8 shift_type = (instructions[instruction_idx] >> 22) & 0x3; 
+            U8 rm = (instructions[instruction_idx] >> 16) & 0x1f;
+            U8 imm6 = (instructions[instruction_idx] >> 10) & 0x1f;
+            U8 rn = (instructions[instruction_idx] >> 5) & 0x1f;
+            U8 rd = instructions[instruction_idx] & 0x1f;
+        
+            if (n == 0) // ORR
+            {
+              if (sf)
+              {
+                U64* xm_ptr = gp_regx(gp_regs, rm); 
+                U64* xn_ptr = gp_regx(gp_regs, rn); 
+                U64* xd_ptr = gp_regx(gp_regs, rd); 
+
+                *xd_ptr = *xn_ptr | ((shift_type == 0) ? *xm_ptr << imm6 : *xm_ptr >> imm6);
+              }
+              else
+              {
+                U32* wm_ptr = &((U32*)&((U64*)gp_regs)[rm])[0]; 
+                U32* wn_ptr = &((U32*)&((U64*)gp_regs)[rn])[0]; 
+                U32* wd_ptr = &((U32*)&((U64*)gp_regs)[rd])[0]; 
+
+                *wd_ptr = *wn_ptr | ((shift_type == 0) ? *wm_ptr << imm6 : *wm_ptr >> imm6);
+              }
+            }
+            else // ORN
+            {
+              InvalidPath;
+            }
+          } break;
+          default: InvalidPath;
+        }
+      }
+      else
+      {
+        InvalidPath; // Unhandled data process register group encoding
       }
     }
     else
@@ -145,10 +207,10 @@ int main(int argc, char* argv[])
     }
   }
 
-  // DEBUG print registers
-  for (U8 reg_idx=0; reg_idx < 16; ++reg_idx)
+  // DEBUG print gp_regs 
+  for (U8 reg_idx=0; reg_idx < 31; ++reg_idx)
   {
-    printf("X%u: %llu\tW%u: %lu\n", reg_idx, ((U64*)register_memory)[reg_idx], reg_idx, ((U32*)(&((U64*)register_memory)[reg_idx]))[1]);
+    printf("X%u: %llu\tW%u: %lu\n", reg_idx, *gp_regx(gp_regs, reg_idx), reg_idx, *gp_regw(gp_regs, reg_idx));
   }
 
   return 0;
