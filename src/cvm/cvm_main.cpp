@@ -8,6 +8,13 @@
 #include "base/base_inc.h"
 #include "os/os_inc.h"
 
+// TODO(calebarg): Handle MSVC compilation 
+// Either gernate a compile error here or 
+// Create wrappers for the linux specific stuff.
+#include <sys/time.h>
+#include <signal.h>
+#include <termios.h>
+
 #include "base/base_inc.cpp"
 #include "os/os_inc.cpp"
 
@@ -43,16 +50,300 @@ struct ELF_SectionHeader
 	U64 entsize;
 };
 
-inline U64* gp_regx(U8* gp_regs, U8 reg_idx) 
+typedef U8 ShiftType;
+enum
+{
+  ShiftType_lsl = 0,
+  ShiftType_lsr, 
+  ShiftType_asr 
+};
+
+typedef U8 BranchType;
+enum
+{ 
+  BranchType_dir = 0,
+  BranchType_dir_call,
+  BranchType_ret
+};
+
+typedef U8 El;
+enum
+{ 
+  El_0 = 0, // Application level
+  El_1, // OS level "privleged" 
+  El_2, // Hypervisor (Not implemented)
+  El_3, // Monitor (Not implemented)
+};  
+
+struct PSTATE
+{
+  U64 n: 1;
+  U64 z: 1; 
+  U64 c: 1;
+  U64 v: 1;
+
+  U64 pad0: 3;
+  U64 el: 2;
+
+  U64 pad1: 55;
+};
+
+inline U64* gp_reg_u64(U8* gp_regs, U8 reg_idx) 
 {
   U64* gp_regs_ptrx = (U64*)gp_regs;
   return (gp_regs_ptrx + reg_idx);   
 }
 
-inline U32* gp_regw(U8* gp_regs, U8 reg_idx) 
+inline U32* gp_reg_u32(U8* gp_regs, U8 reg_idx) 
 {
   U64* gp_regs_ptrx = (U64*)gp_regs;
   return (U32*)(gp_regs_ptrx + reg_idx);   
+}
+
+// TODO(calebarg): Join these sign extend functions together.
+
+inline U64 se_u32_to_u64(U32 val) 
+{
+  U32 result = val;
+  if (val & 0x80000000) 
+  {
+    result |= 0xffffffff00000000;
+  }
+  return result;
+}
+
+inline U32 se_imm19_to_u32(U32 imm19) 
+{
+  U32 result = imm19;
+  if (imm19 & 0x40000) 
+  {
+    result |= 0xfff80000;
+  }
+  return result;
+}
+
+inline U64 se_imm26_to_u64(U32 imm26)
+{
+  U64 result = 0;
+  result |= imm26;
+  if (imm26 & 0x2000000) 
+  {
+    result |= 0xfffffffffc000000;
+  }
+  return result;
+}
+
+inline U64 ze_imm12_to_u64(U16 imm12)
+{
+  U64 result = 0;
+  result |= imm12;
+  return result;
+}
+
+inline U32 ze_imm12_to_u32(U16 imm12)
+{
+  U32 result = 0;
+  result |= imm12;
+  return result;
+}
+
+internal U32 add_with_carry_u32(
+	PSTATE* pstate, 
+	U32 lhs, 
+	U32 rhs, 
+	U8 carry_in)
+{
+	U32 unsigned_sum = lhs + rhs + (U32)(carry_in);
+	S32 signed_sum = (S32)(lhs) + (S32)(rhs) + (S32)(carry_in);
+
+  U32 result = unsigned_sum;
+
+  // N flag - negative
+  (result & 0x80000000) ? (pstate->n = 1) : (pstate->n = 0);
+
+  // Z flag - zero
+  (result == 0) ? (pstate->z = 1) : (pstate->z = 0);
+  
+  // C flag - carry 
+  ((U32)(result) == unsigned_sum) ? (pstate->c = 0) : (pstate->c = 1);
+  
+  // V flag - signed overflow
+  ((S32)(result) == signed_sum) ?  (pstate->v = 0) : (pstate->v = 1);
+
+  return result;
+}
+
+internal U64 add_with_carry_u64(
+	PSTATE* pstate, 
+	U64 lhs, 
+	U64 rhs, 
+	U8 carry_in)
+{
+  U64 unsigned_sum = lhs + rhs + (U64)(carry_in);
+  S64 signed_sum = (S64)(lhs) + (S64)(rhs) + (S64)(carry_in);
+
+  U64 result = unsigned_sum;
+
+  // N flag - negative
+  (result & 0x8000000000000000) ? (pstate->n = 1) : (pstate->n = 0);
+
+  // Z flag - zero
+  (result == 0) ? (pstate->z = 1) : (pstate->z = 0);
+  
+  // C flag - carry 
+  ((U32)(result) == unsigned_sum) ? (pstate->c = 0) : (pstate->c = 1);
+  
+  // V flag - signed overflow
+  ((S32)(result) == signed_sum) ?  (pstate->v = 0) : (pstate->v = 1);
+  return result;
+}
+
+internal U32 shift_reg_u32(U32 val, ShiftType shift_type, U8 shift_amount)
+{
+  U32 result = val;
+
+  switch (shift_type)
+  {
+    case ShiftType_lsl:
+    {  
+      result = result << shift_amount;
+    } break;
+    case ShiftType_lsr:
+    {  
+      result = result >> shift_amount;
+    } break;
+    case ShiftType_asr:
+    {  
+      U32 result_copy = result;
+      result = result >> shift_amount;
+      result |= (result_copy & 0x80000000);
+    } break;
+    default: InvalidPath;
+  }
+
+  return result;
+}
+
+internal U64 shift_reg_u64(U64 val, ShiftType shift_type, U8 shift_amount)
+{
+  U64 result = val;
+
+  switch (shift_type)
+  {
+    case ShiftType_lsl:
+    {  
+      result = result << shift_amount;
+    } break;
+    case ShiftType_lsr:
+    {  
+      result = result >> shift_amount;
+    } break;
+    case ShiftType_asr:
+    {  
+      U64 result_copy = result;
+      result = result >> shift_amount;
+      result |= (result_copy & 0x8000000000000000);
+    } break;
+    default: InvalidPath;
+  }
+
+  return result;
+}
+
+El s1_translation_regime(El exception_level)
+{
+  if (exception_level != El_0)
+  {
+    return exception_level;
+  }
+  return El_1;
+
+  // I don't implement the other exception levels 
+}
+
+// HACK(Caleb): Fix this at some point.   
+U8 effective_tbi(U64 address, B8 is_instr, El el)
+{
+  return 0;
+}
+
+// Return the MSB number of a virtual address in the stage 1 translation regime 
+// for "el".
+U64 addr_top(U64 address, B8 is_instr, El el)
+{
+  El regime = s1_translation_regime(el);
+  if (effective_tbi(address, is_instr, regime) == 1)
+  {
+    return 55;
+  }
+  return 63; 
+}
+
+U64 branch_addr(U64 vaddress, El el)
+{
+  U64 msb = addr_top(vaddress, 1, el);
+  if (msb == 63)
+  {
+    return vaddress;
+  }
+  InvalidPath;
+  return 69;
+}
+
+// FIXME(calebarg): No reason to pass pstate as a pointer here.
+// (In fact don't need to pass it at all atm).
+internal void branch_to(
+    U64* pc, 
+    PSTATE* pstate, 
+    U64 target, 
+    BranchType branch_type, 
+    B8 branch_conditional)
+{ 
+  U64 target_vaddress = branch_addr(target, (El)pstate->el);
+  *pc = target_vaddress; 
+}
+
+internal B8 condition_holds(U8 cond, PSTATE pstate)
+{
+  B8 result = 0;
+  switch(cond >> 1) {
+		case 0x0: // EQ or NE
+		{
+			result = (B8)(pstate.z == 1);
+		} break;
+		case 0x5: // GE or LT
+		{
+			result = (B8)(pstate.n == pstate.v);
+		} break;
+		case 0x6: // GT or LE
+		{
+			result = (B8)((pstate.n == pstate.v) && (pstate.z == 0));
+		} break;
+		default: InvalidPath;
+	}
+	// Condition flag values in the set '111x' indicate always true
+	// Otherwise, invert condition if necessary.
+	if ((cond & 0x1) && (cond != 0xf))
+	{
+		result = !result;
+	}
+
+  return result;
+}
+
+F64 read_wall_clock()
+{
+  struct timeval tv;
+  gettimeofday(&tv, 0);
+  
+  return (F64)tv.tv_sec + (F64)tv.tv_usec * .000001;
+}
+
+B8 running = 1;
+
+internal void quit_on_ctrlc(int) 
+{
+	running = 0;
 }
 
 int main(int argc, char* argv[])
@@ -81,7 +372,9 @@ int main(int argc, char* argv[])
     }
 
     U64 offset = elf_header->shoff;
-    for (U16 section_idx=0; section_idx < elf_header->shnum; ++section_idx)
+    for (U16 section_idx=0; 
+         section_idx < elf_header->shnum; 
+         ++section_idx)
     {
       ELF_SectionHeader* section_header =
       (ELF_SectionHeader*)(&elf_contents.data[offset]);
@@ -101,117 +394,567 @@ int main(int argc, char* argv[])
     InvalidPath; // Issue reading input file
   }
 
-  // TODO(actually read the manual)
   U8* gp_regs = (U8*)arena_push(arena, 32*8); // NOTE(caleb): R31 is reserved as the zero register.
   memset(gp_regs, 0, 32*8);
 
+  U64 pc = 0;
+  U64* pc_ptr = &pc;
+
+  // Special purpose registers   
+  PSTATE pstate{};   
+  if (sizeof(pstate) != 8)
+  {
+    InvalidPath;
+  } 
+
+  // NOTE(calebarg): Not sure how I'm going to do this long term.
+  U8* memory = (U8*)arena_push(arena, 512);
+  for (U64 byte_idx=0; byte_idx < 512; ++byte_idx)
+  {
+    memory[byte_idx] = 0;
+    if (!(byte_idx % 20)) 
+    { 
+      memory[byte_idx] = 2;
+    }
+  }
+//  memory[312 + 15] = 2; // DEBUG food
+
+  // Catch ctrl-c so the terminal so the terminal can be restored. 
+	struct sigaction sa;	
+	sa.sa_handler = quit_on_ctrlc; 
+	if (sigaction(SIGINT, &sa, 0) == -1)  
+	{
+		InvalidPath; 
+	}
+
+  struct termios old_term_attribs;
+  if (tcgetattr(STDIN_FILENO, &old_term_attribs) == -1) 
+  {
+    InvalidPath;
+  }
+
+  struct termios new_term_attribs = old_term_attribs;
+  new_term_attribs.c_lflag &= ~(ECHO | ICANON);
+  new_term_attribs.c_cc[VMIN] = 0; // Minimum number of characters for noncanonical read 
+  new_term_attribs.c_cc[VTIME] = 0; // Timout in deciseconds for noncanonical read
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term_attribs) == -1)
+  {
+    InvalidPath;
+  }
+
+  alternate_screen_buffer();
+
+  // Initial screen clear 
+  for (U32 row_idx=0; row_idx < 100; ++row_idx) 
+  {
+    move_cursor(row_idx + 1, 1);
+    clear_line();
+  }
+
+  F64 instructions_per_second = (1000.0 / 1000000.0); // <-- Clock speed (1MHz)
+  F64 last_time = read_wall_clock();
+
   U64 instruction_count = machine_code.len / 4;
   U32* instructions = (U32*)machine_code.data;
-  for (U64 instruction_idx=0; instruction_idx < instruction_count; ++instruction_idx)
-  {
-    // DEBUG print the instruction
-    printf("%llx: %lx\n", instruction_idx*4, instructions[instruction_idx]);
+  while ((*pc_ptr < instruction_count) && (running)) 
+  { 
+    U8 input_byte = 0;
 #if 0
-    U8 most_signif_byte = ((U8*)(&instructions[instruction_idx]))[3];
-    printf("%b  ", most_signif_byte);
-    U8 next_most_signif_byte = ((U8*)(&instructions[instruction_idx]))[2];
-    printf("%b\n", next_most_signif_byte);
-#endif
-    U8 decode_group = (instructions[instruction_idx] >> 25) & 0xf;
-    if (decode_group & 0x8) // Data processing immediate group
+    if (read(STDIN_FILENO, &input_byte, 1) != 0)
     {
-      U8 instruction_class = (instructions[instruction_idx] >> 22) & 0xf;
-      if (instruction_class & 0xa) // Move wide immediate instruction class
+      memory[310] = input_byte;
+    }
+#endif
+
+    F64 time_now = read_wall_clock();
+    F64 time_since_last_frame_ms = (time_now * 1000) - (last_time * 1000);
+    if (time_since_last_frame_ms >= instructions_per_second)
+    {
+      last_time = time_now;
+      B8 modified_pc = 0;
+      U32 curr_instruction = instructions[*pc_ptr];
+
+      U8 decode_group = (curr_instruction >> 25) & 0xf;
+      B8 sf = (curr_instruction >> 31) & 0x1;
+      if ((decode_group & 0x8) && // Data processing -- immediate
+          !(decode_group & 0x4) &&
+          !(decode_group & 0x2)) 
       {
-        // This bit determines if this is a 32 or 64 version of this operation
-        B8 sf = (instructions[instruction_idx] >> 31) & 0x1;
-        U8 op_code = (instructions[instruction_idx] >> 29) & 0x3;
-        switch (op_code)
+        U8 op0 = (curr_instruction >> 22) & 0xf;
+        if (!(op0 & 0x8) && (op0 & 4) && !(op0 & 2)) // Add/Subtract (immediate)
         {
-          case 0x2: // MOVZ 
+          U8 op = (curr_instruction >> 30) & 0x1;
+          U8 s = (curr_instruction >> 29) & 0x1;
+
+          if (op) // SUB/SUBS (CMP alias)
           {
-            U16 immediate_val = (instructions[instruction_idx] >> 5) & 0xffff;
-            U8 dest_reg = instructions[instruction_idx] & 0xf;
+            U8 sh = (curr_instruction >> 22) & 0x1;
+            U16 imm12 = (curr_instruction >> 10) & 0xfff;
+            U8 rn = (curr_instruction >> 5) & 0x1f;
+            U8 rd = curr_instruction & 0x1f;
+
+            if (rn == 31)
+            {
+              InvalidPath; // Not implemented 
+            }
+
+            PSTATE pstate_for_op{}; 
             if (sf)
             {
-              ((U64*)gp_regs)[dest_reg] = immediate_val;
+              U64* xn_ptr = gp_reg_u64(gp_regs, rn); 
+              U64* xd_ptr = gp_reg_u64(gp_regs, rd); 
+              U64 imm = ze_imm12_to_u64(imm12);
+              *xd_ptr = add_with_carry_u64(&pstate_for_op, *xn_ptr, ~imm, 1);
             }
             else
             {
-              ((U32*)(&((U64*)gp_regs)[dest_reg]))[1] = immediate_val;
+              U32* wn_ptr = gp_reg_u32(gp_regs, rn); 
+              U32* wd_ptr = gp_reg_u32(gp_regs, rd); 
+              U32 imm = ze_imm12_to_u32(imm12);
+              *wd_ptr = add_with_carry_u32(&pstate_for_op, *wn_ptr, ~imm, 1);
             }
-          } break;
-          default: break;
-        }
-      }
-      else
-      {
-        InvalidPath; // Unsupported instruction class
-      }
-    }
-    else if(decode_group & 0x5) // Data processing register group
-    {
-      U8 op0 = (instructions[instruction_idx] >> 30) & 0x1;
-      U8 op1 = (instructions[instruction_idx] >> 28) & 0x1;      
-      U8 op2 = (instructions[instruction_idx] >> 21) & 0xf;      
-      if (!op1 && !(op2 & 0x8)) // Logical (shifted register) instruction class 
-      {
-        B8 sf = (instructions[instruction_idx] >> 31) & 0x1;
-        U8 opc = (instructions[instruction_idx] >> 29) & 0x3;
-        switch (opc)
-        {
-          case 0x1: // ORR/ORN
-          {
-            U8 n = (instructions[instruction_idx] >> 21) & 0x1; 
-            U8 shift_type = (instructions[instruction_idx] >> 22) & 0x3; 
-            U8 rm = (instructions[instruction_idx] >> 16) & 0x1f;
-            U8 imm6 = (instructions[instruction_idx] >> 10) & 0x1f;
-            U8 rn = (instructions[instruction_idx] >> 5) & 0x1f;
-            U8 rd = instructions[instruction_idx] & 0x1f;
-        
-            if (n == 0) // ORR
+            if (s)
             {
+              pstate = pstate_for_op;
+            }
+          }
+          else 
+          {
+            InvalidPath; // Not implemented
+          }
+        }
+        else if (op0 & 0xa && !(op0 & 4)) // Move wide (immediate) 
+        {
+          U8 op_code = (curr_instruction >> 29) & 0x3;
+          switch (op_code)
+          {
+            case 0x2: // MOVZ 
+            {
+              U16 immediate_val = (curr_instruction >> 5) & 0xffff;
+              U8 dest_reg = curr_instruction & 0xf;
               if (sf)
               {
-                U64* xm_ptr = gp_regx(gp_regs, rm); 
-                U64* xn_ptr = gp_regx(gp_regs, rn); 
-                U64* xd_ptr = gp_regx(gp_regs, rd); 
-
-                *xd_ptr = *xn_ptr | ((shift_type == 0) ? *xm_ptr << imm6 : *xm_ptr >> imm6);
+                ((U64*)gp_regs)[dest_reg] = immediate_val;
               }
               else
               {
-                U32* wm_ptr = &((U32*)&((U64*)gp_regs)[rm])[0]; 
-                U32* wn_ptr = &((U32*)&((U64*)gp_regs)[rn])[0]; 
-                U32* wd_ptr = &((U32*)&((U64*)gp_regs)[rd])[0]; 
-
-                *wd_ptr = *wn_ptr | ((shift_type == 0) ? *wm_ptr << imm6 : *wm_ptr >> imm6);
+                U32* wd_ptr = gp_reg_u32(gp_regs, dest_reg);
+                *wd_ptr = immediate_val;
               }
-            }
-            else // ORN
+            } break;
+            default: break;
+          }
+        }
+        else
+        {
+          InvalidPath; // Unsupported instruction class
+        }
+      }
+      else if ((decode_group & 0xa) && // Branches, exception generating and system instructions
+              !(decode_group & 0x4))
+      { 
+        U8 op0 = (curr_instruction >> 29) & 0x7;
+        U16 op1 = (curr_instruction >> 12) & 0x3fff;    
+        if (!(op0 & 0x4) &&  // Conditional branch (immediate)
+            (op0 & 0x2) && 
+            !(op0 & 0x1) && 
+            !(op1 & 0x2000))
+        {
+          U8 o1 = (curr_instruction >> 24) & 0x1;       
+          U8 o0 = (curr_instruction >> 4) & 0x1;       
+          if (!o1 && !o0) // B.cond
+          {
+            U8 imm19 = (curr_instruction >> 5) & 0x7ffff;
+            U8 cond = curr_instruction & 0xf;
+            if (condition_holds(cond, pstate))
             {
-              InvalidPath;
+              S32 offset = (S32)se_imm19_to_u32(imm19);
+              U64 target_address = *pc_ptr + offset;
+              branch_to(pc_ptr, &pstate, target_address, BranchType_dir, 1);
+              modified_pc = 1;
             }
-          } break;
-          default: InvalidPath;
+          }
+          else 
+          {
+            InvalidPath; // Not Implemented
+          }
+        }       
+        else if ((op0 & 0x4) && (op0 & 0x2) && !(op0 & 0x1) && (op1 & 0x2000)) // Unconditional branch (register)
+        {
+          U8 opc = (curr_instruction >> 21) & 0xf;
+          U8 op2 = (curr_instruction >> 16) & 0x1f;
+          U8 op3 = (curr_instruction >> 10) & 0x3f;
+          U8 rn = (curr_instruction >> 5) & 0x1f;
+          U8 op4 = curr_instruction & 0x1f;
+
+          if ((opc & 0x2) && (op2 & 0x1f) && !op3 && !op4) // RET
+          {
+            U64 target = *gp_reg_u64(gp_regs, rn);
+            branch_to(pc_ptr, &pstate, target, BranchType_ret, 0);
+            modified_pc = 1;
+          }                                                                    
+          else
+          {
+            InvalidPath;
+          }
+        }                                             
+        else if (!(op0 & 0x1) && !(op0 & 0x2)) // Unconditional branch (immediate) B/BL
+        {
+          U8 op = (curr_instruction >> 31) & 0x1;
+          U32 imm26 = curr_instruction & 0x3ffffff;
+          U64 offset = se_imm26_to_u64(imm26);
+          BranchType branch_type = BranchType_dir;
+          if (op) // Store return address in r30 (BL)
+          {
+            *gp_reg_u64(gp_regs, 30) = *pc_ptr + 1;
+            branch_type = BranchType_dir_call;
+          }
+          branch_to(pc_ptr, &pstate, *pc_ptr + offset, branch_type, 0);
+          modified_pc = 1;
+        } 
+        else if ((op0 & 0x1) && (~op1 & 0x2000)) // Compare and branch (immediate)
+        {
+          U8 op = (curr_instruction >> 24) & 0x1;       
+          U32 imm19 = (curr_instruction >> 5) & 0x7ffff;
+          U8 rt = curr_instruction & 0x1f;
+          B8 take_branch = 0;
+
+          if (sf) // CBZ/CBNZ 64 bit
+          { 
+            U64* xt_ptr = gp_reg_u64(gp_regs, rt); 
+            if (((*xt_ptr == 0) && (op == 0)) ||  // CBZ
+                ((*xt_ptr != 0) && (op == 1)))  // CBNZ
+            {
+              take_branch = 1;
+            }
+          }
+          else // CBZ/CBNZ 32 bit
+          {
+            U32* wt_ptr = gp_reg_u32(gp_regs, rt); 
+            if (((*wt_ptr == 0) && (op == 0)) ||  // CBZ
+                ((*wt_ptr != 0) && (op == 1)))  // CBNZ
+            {
+              take_branch = 1;
+            }
+          }
+
+          if (take_branch)  
+          {
+            S32 offset = (S32)se_imm19_to_u32(imm19);
+            U64 target_address = *pc_ptr + offset;
+            branch_to(pc_ptr, &pstate, target_address, BranchType_dir, 1);
+            modified_pc = 1;
+          }
+        }
+        else 
+        {
+          InvalidPath;
+        }
+      }
+      else if ((decode_group & 0x4) &&  // Loads and Stores
+              !(decode_group & 0x1))
+      {
+        U8 op0 = (curr_instruction >> 28) & 0xf;
+        U8 op1 = (curr_instruction >> 26) & 0x1;      
+
+        if ((op0 & 0x1) && !(op0 & 0x2)) // Load/Store register literal 
+        {
+          U8 opc = (curr_instruction >> 30) & 0x3;
+          U8 vr = (curr_instruction >> 26) & 0x1;
+        
+          switch (opc)
+          {
+            case 0x1: // LDR
+            {
+              U32 imm19 = (curr_instruction >> 5) & 0x7ffff;     
+              U8 rt = curr_instruction & 0x1f;
+
+              S32 offset = (S32)se_imm19_to_u32(imm19);
+              U32 address = *pc_ptr + offset; 
+
+              U64* xt_ptr = gp_reg_u64(gp_regs, rt); 
+              *xt_ptr = se_u32_to_u64(memory[address]);
+            } break;
+            default: InvalidPath;
+          }
+        }
+        else if ((op0 & 0x1) && (op0 & 0x2)) // Load/Store register (register offset) 
+        {
+          U8 size = (curr_instruction >> 30) & 0x3;   
+          U8 vr = (curr_instruction >> 26) & 0x1;
+          U8 opc = (curr_instruction >> 22) & 0x3;   
+          switch (opc)
+          {
+            case 0x0: // STR/STRB
+            {
+              U8 rt = curr_instruction & 0x1f;
+              U8 rn = (curr_instruction >> 5) & 0x1f;
+              U8 option = (curr_instruction >> 13) & 0x7;
+              if (option != 0x0)
+              {
+                InvalidPath; // Unxexpected option value 
+              }
+              switch (size) 
+              {
+                case 0x0: // STRB
+                {
+                  U32* wt_ptr = gp_reg_u32(gp_regs, rt);
+                  U64* xn_ptr = gp_reg_u64(gp_regs, rn);
+                  memory[*xn_ptr] = (U8)*wt_ptr;
+                } break;
+                case 0x3: // STR 
+                {
+                  U64* xt_ptr = gp_reg_u64(gp_regs, rt);
+                  U64* xn_ptr = gp_reg_u64(gp_regs, rn);
+                  *(U64*)(&memory[*xn_ptr]) = *xt_ptr;
+                } break;
+                default: InvalidPath;
+              }
+            } break; 
+            case 0x1: // LDR/LDRB
+            {
+              U8 rt = curr_instruction & 0x1f;
+              U8 rn = (curr_instruction >> 5) & 0x1f;
+              U8 option = (curr_instruction >> 13) & 0x7;
+
+              if (option != 0x0)
+              {
+                InvalidPath; // Unxexpected option value 
+              }
+              switch (size) 
+              {
+                case 0x0: // LDRB
+                {
+                  U32* wt_ptr = gp_reg_u32(gp_regs, rt);
+                  U64* xn_ptr = gp_reg_u64(gp_regs, rn);
+                  *wt_ptr = memory[*xn_ptr];
+                } break;
+                case 0x3: // LDR 
+                {
+                  U64* xt_ptr = gp_reg_u64(gp_regs, rt);
+                  U64* xn_ptr = gp_reg_u64(gp_regs, rn);
+                  *xt_ptr = *(U64*)(&memory[*xn_ptr]);
+                } break;
+                default: InvalidPath;
+              }
+            } break;         
+            default: InvalidPath;
+          }
+        }                                           
+        else 
+        {
+          InvalidPath; // Unhandled decode group 
+        }
+      } 
+      else if ((decode_group & 0x5) && // Data processing -- register
+              !(decode_group & 0x2)) 
+      {
+        U8 op0 = (curr_instruction >> 30) & 0x1;
+        U8 op1 = (curr_instruction >> 28) & 0x1;      
+        U8 op2 = (curr_instruction >> 21) & 0xf;      
+        if (!op1 && !(op2 & 0x8)) // Logical (shifted register) 
+        {
+          U8 opc = (curr_instruction >> 29) & 0x3;
+          U8 n = (curr_instruction >> 21) & 0x1; 
+          U8 imm6 = (curr_instruction >> 10) & 0x1f;
+
+          switch (opc)
+          {
+            case 0x1: // ORR/ORN (MOV alias)
+            {
+              U8 shift = (curr_instruction >> 22) & 0x3; 
+              U8 rm = (curr_instruction >> 16) & 0x1f;
+              U8 rn = (curr_instruction >> 5) & 0x1f;
+              U8 rd = curr_instruction & 0x1f;
+
+              if ((shift != 0) || (imm6 != 0) || (n != 0))
+              {
+                InvalidPath; // Not a MOV alias 
+              }
+
+              if (sf)
+              {
+                U64* xn_ptr = gp_reg_u64(gp_regs, rn); 
+                U64* xm_ptr = gp_reg_u64(gp_regs, rm); 
+                U64* xd_ptr = gp_reg_u64(gp_regs, rd); 
+                *xd_ptr = (*xn_ptr | (*xm_ptr << imm6));
+              }
+              else
+   
+              {
+                U32* wn_ptr = gp_reg_u32(gp_regs, rn); 
+                U32* wm_ptr = gp_reg_u32(gp_regs, rm); 
+                U32* wd_ptr = gp_reg_u32(gp_regs, rd); 
+                *wd_ptr = (*wn_ptr | (*wm_ptr << imm6));
+              }
+            } break;
+            default: InvalidPath;
+          }
+        }
+        else if (!op1 && (op2 & 0x8) && !(op2 & 0x1)) // Add/Subtract (shifted register) 
+        {
+          U8 s = (curr_instruction >> 29) & 0x1;
+          U8 shift_type = (curr_instruction >> 22) & 0x3; 
+          U8 rm = (curr_instruction >> 16) & 0x1f;
+          U8 imm6 = (curr_instruction >> 10) & 0x1f;
+          U8 rn = (curr_instruction >> 5) & 0x1f;
+          U8 rd = curr_instruction & 0x1f;
+
+          U64* xm_ptr = gp_reg_u64(gp_regs, rm); 
+          U64* xn_ptr = gp_reg_u64(gp_regs, rn); 
+          U64* xd_ptr = gp_reg_u64(gp_regs, rd); 
+
+          U32* wm_ptr = gp_reg_u32(gp_regs, rm); 
+          U32* wn_ptr = gp_reg_u32(gp_regs, rn); 
+          U32* wd_ptr = gp_reg_u32(gp_regs, rd); 
+
+          if (!op0 && !s) // ADD
+          {
+            if (sf)
+            {
+              U64 rhs = shift_reg_u64(*xm_ptr, shift_type, imm6);
+              *xd_ptr = add_with_carry_u64(&pstate, *xn_ptr, rhs, 0);
+            }
+            else 
+            {
+              U32 rhs = shift_reg_u32(*wm_ptr, shift_type, imm6);
+              *wd_ptr = add_with_carry_u32(&pstate, *wn_ptr, rhs, 0);
+            }
+          }        
+          else if (op0 && !s) // SUB 
+          {
+            if (sf)
+            {
+              U64 rhs = ~shift_reg_u64(*xm_ptr, shift_type, imm6);
+              *xd_ptr = add_with_carry_u64(&pstate, *xn_ptr, rhs, 1);
+            }
+            else 
+            {            
+              U32 rhs = ~shift_reg_u32(*wm_ptr, shift_type, imm6);
+              *wd_ptr = add_with_carry_u32(&pstate, *wn_ptr, rhs, 1);
+            }
+          }
+        }
+
+        else if (op1 && (op2 & 0x8)) // Data-processing (3 source)
+        {
+          U8 op54 = (curr_instruction >> 29) & 0x3;
+          U8 op31 = (curr_instruction >> 21) & 0x7; 
+          U8 rm = (curr_instruction >> 16) & 0x1f;
+          U8 o0 = (curr_instruction >> 15) & 0x1;
+          U8 ra = (curr_instruction >> 10) & 0x1f;
+          U8 rn = (curr_instruction >> 5) & 0x1f;
+          U8 rd = curr_instruction & 0x1f;
+
+          if (!op54 && !op31 && !o0) // MADD (aliased to MUL when ra is the zero register)
+          {
+            if (sf) // FIXME(calebarg): Update PSTATE. See MADD psudeo code. 
+            {
+              U64* xn_ptr = gp_reg_u64(gp_regs, rn);
+              U64* xm_ptr = gp_reg_u64(gp_regs, rm);
+              U64* xa_ptr = gp_reg_u64(gp_regs, ra);
+              U64* xd_ptr = gp_reg_u64(gp_regs, rd);
+
+              *xd_ptr = *xa_ptr + *xn_ptr * *xm_ptr;            
+            }           
+            else 
+            {
+              U32* wn_ptr = gp_reg_u32(gp_regs, rn);
+              U32* wm_ptr = gp_reg_u32(gp_regs, rm);
+              U32* wa_ptr = gp_reg_u32(gp_regs, ra);
+              U32* wd_ptr = gp_reg_u32(gp_regs, rd);
+
+              *wd_ptr = *wa_ptr + *wn_ptr * *wm_ptr;
+            }
+          }
+          else
+          {
+            InvalidPath; 
+          }
+        }
+        else
+        {
+          InvalidPath; // Unhandled data process register group encoding
         }
       }
       else
       {
-        InvalidPath; // Unhandled data process register group encoding
+        printf("Unhandled decode group %b\n", decode_group);
       }
-    }
-    else
-    {
-      printf("Unhandled decode group %b\n", decode_group);
+
+			*gp_reg_u64(gp_regs, 31) = 0;
+      if (!modified_pc)
+      {
+        (*pc_ptr)++;
+      }
+
+      move_cursor(1, 1);
+      for (U32 row_idx=0; row_idx < 32; ++row_idx) 
+      {
+        printf("W%02ld: %08x", row_idx, *gp_reg_u32(gp_regs, row_idx));
+
+        dec_character_set();
+        printf("  %c  ", 97);
+        ascii_character_set();
+
+        printf("%03x: ", row_idx * 4);
+        for (U32 col_idx=0; col_idx < 4; ++col_idx) 
+        {
+          if ((row_idx * 4 + col_idx) < 128)
+          {
+            printf("%08x ", ((U32*)memory)[row_idx * 4 + col_idx]);
+          }
+        }
+        printf("\n");
+      }
+      printf("N:%u , Z:%u , C:%u , V:%u\n", pstate.n, pstate.z, pstate.c, pstate.v);
+      printf("PC: %x\n", *pc_ptr);
+     
+#if 0
+      // Crash if took to long (realtime 1MHz hard req)
+      F64 instruction_time = read_wall_clock() * 1000 - last_time * 1000;
+      if (instruction_time > instructions_per_second)
+      {
+        printf("MAX TIME: %lf, TOOK: %lf, PC: %llu\n", instructions_per_second, instruction_time, pc);
+        InvalidPath;
+      }
+#endif
+
+      if (memory[311]) // The program will write this byte when it wants a draw call.
+      {
+        // Draw display 10 rows by 20 cols 
+        U8* display_memory = &memory[312];
+        for (U32 row_idx = 0; row_idx < 10; ++row_idx)
+        {
+          move_cursor(row_idx + 1, 64);
+          for (U32 col_idx = 0; col_idx < 20; ++col_idx)
+          {
+            if (display_memory[row_idx * 20 + col_idx] == 2)
+            {
+              putc('f', stdout);
+            }
+            else if (display_memory[row_idx * 20 + col_idx])
+            {
+              putc('#', stdout);
+            } 
+            else
+            {
+              putc(' ', stdout);
+            }
+          }
+        }
+        memory[311] = 0;
+      }
+
     }
   }
 
-  // DEBUG print gp_regs 
-  for (U8 reg_idx=0; reg_idx < 31; ++reg_idx)
+  main_screen_buffer();
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &old_term_attribs) == -1)
   {
-    printf("X%u: %llu\tW%u: %lu\n", reg_idx, *gp_regx(gp_regs, reg_idx), reg_idx, *gp_regw(gp_regs, reg_idx));
+    InvalidPath;
   }
 
   return 0;
 }
+
